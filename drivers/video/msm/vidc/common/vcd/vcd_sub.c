@@ -1871,7 +1871,7 @@ u32 vcd_handle_recvd_eos(
 					VCD_CLIENT_STATE_EOS,
 					CLIENT_STATE_EVENT_NUMBER
 					(encode_frame));
-		} else {
+        } else {
 			transc = vcd_get_first_in_use_trans_for_clnt(cctxt);
 			if (transc) {
 				transc->flags |= VCD_FRAME_FLAG_EOS;
@@ -3585,6 +3585,17 @@ u32 vcd_set_num_slices(struct vcd_clnt_ctxt *cctxt)
 					__func__, cctxt->num_slices);
 	} else {
 		cctxt->num_slices = 1;
+	}
+	return rc;
+}
+
+u32 vcd_handle_ltr_use_failed(struct vcd_clnt_ctxt *cctxt,
+	void *payload, size_t sz, u32 status)
+{
+	u32 rc = VCD_S_SUCCESS;
+	if (payload && cctxt) {
+		cctxt->callback(VCD_EVT_IND_INFO_LTRUSE_FAILED,
+			status, payload, sz, cctxt, cctxt->client_data);
 	}
 	return rc;
 }

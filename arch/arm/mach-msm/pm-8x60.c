@@ -19,6 +19,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/cpu.h>
 #include <linux/pm.h>
 #include <linux/pm_qos.h>
 #include <linux/smp.h>
@@ -60,6 +61,7 @@
 #include <linux/regulator/consumer.h>
 #include <mach/gpiomux.h>
 #include <linux/mfd/pm8xxx/pm8921.h>
+#include <linux/cpu_pm.h>
 
 /******************************************************************************
  * Debug Definitions
@@ -554,6 +556,9 @@ static bool __ref msm_pm_spm_power_collapse(
 		pr_info("CPU%u: %s: notify_rpm %d\n",
 			cpu, __func__, (int) notify_rpm);
 
+	if (from_idle == true)
+		cpu_pm_enter();
+
 	ret = msm_spm_set_low_power_mode(
 			MSM_SPM_MODE_POWER_COLLAPSE, notify_rpm);
 	WARN_ON(ret);
@@ -596,6 +601,10 @@ static bool __ref msm_pm_spm_power_collapse(
 
 	ret = msm_spm_set_low_power_mode(MSM_SPM_MODE_CLOCK_GATING, false);
 	WARN_ON(ret);
+
+	if (from_idle == true)
+		cpu_pm_exit();
+
 	return collapsed;
 }
 
@@ -764,7 +773,7 @@ static void msm_pm_set_timer(uint32_t modified_time_us)
 	u64 modified_time_ns = modified_time_us * NSEC_PER_USEC;
 	ktime_t modified_ktime = ns_to_ktime(modified_time_ns);
 	pm_hrtimer.function = pm_hrtimer_cb;
-	hrtimer_start(&pm_hrtimer, modified_ktime, HRTIMER_MODE_ABS);
+	hrtimer_start(&pm_hrtimer, modified_ktime, HRTIMER_MODE_REL);
 }
 
 /******************************************************************************
@@ -816,7 +825,7 @@ int msm_pm_idle_prepare(struct cpuidle_device *dev,
 
 		switch (mode) {
 		case MSM_PM_SLEEP_MODE_POWER_COLLAPSE:
-			if (num_online_cpus() > 1) {
+			if (num_online_cpus() > 1 || cpu_maps_is_updating()) {
 				allow = false;
 				break;
 			}
@@ -911,8 +920,11 @@ int msm_pm_idle_enter(enum msm_pm_sleep_mode sleep_mode)
 		break;
 
 	case MSM_PM_SLEEP_MODE_POWER_COLLAPSE_STANDALONE:
-		msm_pm_power_collapse_standalone(true);
-		exit_stat = MSM_PM_STAT_IDLE_STANDALONE_POWER_COLLAPSE;
+		if(msm_pm_power_collapse_standalone(true))
+			exit_stat = MSM_PM_STAT_IDLE_STANDALONE_POWER_COLLAPSE;
+		else
+			exit_stat =
+			     MSM_PM_STAT_IDLE_FAILED_STANDALONE_POWER_COLLAPSE;
 		break;
 
 	case MSM_PM_SLEEP_MODE_POWER_COLLAPSE: {
@@ -922,7 +934,7 @@ int msm_pm_idle_enter(enum msm_pm_sleep_mode sleep_mode)
 		int ret = -ENODEV;
 		int notify_rpm =
 			(sleep_mode == MSM_PM_SLEEP_MODE_POWER_COLLAPSE);
-		int collapsed;
+		int collapsed = 0;
 
 		timer_expiration = msm_pm_timer_enter_idle();
 
@@ -947,7 +959,10 @@ int msm_pm_idle_enter(enum msm_pm_sleep_mode sleep_mode)
 						true, notify_rpm, collapsed);
 		}
 		msm_pm_timer_exit_idle(timer_halted);
-		exit_stat = MSM_PM_STAT_IDLE_POWER_COLLAPSE;
+		if (collapsed)
+			exit_stat = MSM_PM_STAT_IDLE_POWER_COLLAPSE;
+		else
+			exit_stat = MSM_PM_STAT_IDLE_FAILED_POWER_COLLAPSE;
 		break;
 	}
 
@@ -968,14 +983,13 @@ cpuidle_enter_bail:
 
 int msm_pm_wait_cpu_shutdown(unsigned int cpu)
 {
-	int timeout = 10;
+	int timeout = 0;
 
 	if (!msm_pm_slp_sts)
 		return 0;
 	if (!msm_pm_slp_sts[cpu].base_addr)
 		return 0;
-
-	while (timeout--) {
+	while (1) {
 		/*
 		 * Check for the SPM of the core being hotplugged to set
 		 * its sleep state.The SPM sleep state indicates that the
@@ -986,10 +1000,10 @@ int msm_pm_wait_cpu_shutdown(unsigned int cpu)
 		if (acc_sts & msm_pm_slp_sts[cpu].mask)
 			return 0;
 		udelay(100);
+		WARN(++timeout == 10, "CPU%u didn't collape within 1ms\n",
+					cpu);
 	}
 
-	pr_info("%s(): Timed out waiting for CPU %u SPM to enter sleep state",
-		__func__, cpu);
 	return -EBUSY;
 }
 
@@ -1050,6 +1064,7 @@ static int msm_pm_enter(suspend_state_t state)
 		void *rs_limits = NULL;
 		int ret = -ENODEV;
 		uint32_t power;
+		int collapsed = 0;
 
 		if (MSM_PM_DEBUG_SUSPEND & msm_pm_debug_mask)
 			pr_info("%s: power collapse\n", __func__);
@@ -1074,7 +1089,7 @@ static int msm_pm_enter(suspend_state_t state)
 						msm_pm_max_sleep_time,
 						rs_limits, false, true);
 			if (!ret) {
-				int collapsed = msm_pm_power_collapse(false);
+				collapsed = msm_pm_power_collapse(false);
 				if (pm_sleep_ops.exit_sleep) {
 					pm_sleep_ops.exit_sleep(rs_limits,
 						false, true, collapsed);
@@ -1085,7 +1100,10 @@ static int msm_pm_enter(suspend_state_t state)
 				__func__);
 		}
 		time = msm_pm_timer_exit_suspend(time, period);
-		msm_pm_add_stat(MSM_PM_STAT_SUSPEND, time);
+		if (collapsed)
+			msm_pm_add_stat(MSM_PM_STAT_SUSPEND, time);
+		else
+			msm_pm_add_stat(MSM_PM_STAT_FAILED_SUSPEND, time);
 	} else if (allow[MSM_PM_SLEEP_MODE_POWER_COLLAPSE_STANDALONE]) {
 		if (MSM_PM_DEBUG_SUSPEND & msm_pm_debug_mask)
 			pr_info("%s: standalone power collapse\n", __func__);
@@ -1348,7 +1366,7 @@ static int __init msm_pm_init(void)
 
 	suspend_set_ops(&msm_pm_ops);
 	msm_pm_target_init();
-	hrtimer_init(&pm_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	hrtimer_init(&pm_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	msm_cpuidle_init();
 	platform_driver_register(&msm_pc_counter_driver);
 	rc = platform_driver_register(&msm_cpu_status_driver);
