@@ -150,9 +150,9 @@ struct msm_rpm_ack_msg {
 	uint32_t id_ack;
 };
 
-static int irq_process;
-
 LIST_HEAD(msm_rpm_ack_list);
+
+static struct tasklet_struct data_tasklet;
 
 static void msm_rpm_notify_sleep_chain(struct rpm_message_header *hdr,
 		struct msm_rpm_kvp_data *kvp)
@@ -342,7 +342,7 @@ static void msm_rpm_notify(void *data, unsigned event)
 
 	switch (event) {
 	case SMD_EVENT_DATA:
-		queue_work(msm_rpm_smd_wq, &pdata->work);
+		tasklet_schedule(&data_tasklet);
 		break;
 	case SMD_EVENT_OPEN:
 		complete(&pdata->smd_open);
@@ -530,25 +530,21 @@ error:
 	return 0;
 }
 
-static void msm_rpm_smd_work(struct work_struct *work)
+static void data_fn_tasklet(unsigned long data)
 {
 	uint32_t msg_id;
 	int errno;
 	char buf[MAX_ERR_BUFFER_SIZE] = {0};
-	unsigned long flags;
 
-	while (smd_is_pkt_avail(msm_rpm_data.ch_info) && !irq_process) {
-		spin_lock_irqsave(&msm_rpm_data.smd_lock_read, flags);
-		if (msm_rpm_read_smd_data(buf)) {
-			spin_unlock_irqrestore(&msm_rpm_data.smd_lock_read,
-					flags);
+	spin_lock(&msm_rpm_data.smd_lock_read);
+	while (smd_is_pkt_avail(msm_rpm_data.ch_info)) {
+		if (msm_rpm_read_smd_data(buf))
 			break;
-		}
 		msg_id = msm_rpm_get_msg_id_from_ack(buf);
 		errno = msm_rpm_get_error_from_ack(buf);
 		msm_rpm_process_ack(msg_id, errno);
-		spin_unlock_irqrestore(&msm_rpm_data.smd_lock_read, flags);
 	}
+	spin_unlock(&msm_rpm_data.smd_lock_read);
 }
 
 #define DEBUG_PRINT_BUFFER_SIZE 512
@@ -804,7 +800,14 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 
 int msm_rpm_send_request(struct msm_rpm_request *handle)
 {
-	return msm_rpm_send_data(handle, MSM_RPM_MSG_REQUEST_TYPE, false);
+	int ret;
+	static DEFINE_MUTEX(send_mtx);
+
+	mutex_lock(&send_mtx);
+	ret = msm_rpm_send_data(handle, MSM_RPM_MSG_REQUEST_TYPE, false);
+	mutex_unlock(&send_mtx);
+
+	return ret;
 }
 EXPORT_SYMBOL(msm_rpm_send_request);
 
@@ -863,7 +866,6 @@ int msm_rpm_wait_for_ack_noirq(uint32_t msg_id)
 		return 0;
 
 	spin_lock_irqsave(&msm_rpm_data.smd_lock_read, flags);
-	irq_process = true;
 
 	elem = msm_rpm_get_entry_from_msg_id(msg_id);
 
@@ -896,8 +898,10 @@ int msm_rpm_wait_for_ack_noirq(uint32_t msg_id)
 
 	msm_rpm_free_list_entry(elem);
 wait_ack_cleanup:
-	irq_process = false;
 	spin_unlock_irqrestore(&msm_rpm_data.smd_lock_read, flags);
+
+	if (smd_is_pkt_avail(msm_rpm_data.ch_info))
+		tasklet_schedule(&data_tasklet);
 	return rc;
 }
 EXPORT_SYMBOL(msm_rpm_wait_for_ack_noirq);
@@ -998,7 +1002,7 @@ static int __devinit msm_rpm_dev_probe(struct platform_device *pdev)
 	init_completion(&msm_rpm_data.smd_open);
 	spin_lock_init(&msm_rpm_data.smd_lock_write);
 	spin_lock_init(&msm_rpm_data.smd_lock_read);
-	INIT_WORK(&msm_rpm_data.work, msm_rpm_smd_work);
+	tasklet_init(&data_tasklet, data_fn_tasklet, 0);
 
 	if (smd_named_open_on_edge(msm_rpm_data.ch_name, msm_rpm_data.ch_type,
 				&msm_rpm_data.ch_info, &msm_rpm_data,
@@ -1020,6 +1024,7 @@ static int __devinit msm_rpm_dev_probe(struct platform_device *pdev)
 				WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_HIGHPRI, 1);
 		if (!msm_rpm_smd_wq)
 			return -EINVAL;
+		queue_work(msm_rpm_smd_wq, &msm_rpm_data.work);
 	}
 
 	of_platform_populate(pdev->dev.of_node, NULL, NULL, &pdev->dev);
