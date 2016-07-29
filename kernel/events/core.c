@@ -1230,13 +1230,10 @@ static int __perf_remove_from_context(void *info)
 }
 
 #ifdef CONFIG_SMP
-static void perf_retry_remove(struct perf_event *event, bool detach_group)
+static void perf_retry_remove(struct perf_event *event,
+			      struct remove_event *rep)
 {
 	int up_ret;
-	struct remove_event re = {
-		.event = event,
-		.detach_group = detach_group,
-	};
 	/*
 	 * CPU was offline. Bring it online so we can
 	 * gracefully exit a perf context.
@@ -1245,13 +1242,14 @@ static void perf_retry_remove(struct perf_event *event, bool detach_group)
 	if (!up_ret)
 		/* Try the remove call once again. */
 		cpu_function_call(event->cpu, __perf_remove_from_context,
-				  &re);
+				  rep);
 	else
 		pr_err("Failed to bring up CPU: %d, ret: %d\n",
 		       event->cpu, up_ret);
 }
 #else
-static void perf_retry_remove(struct perf_event *event)
+static void perf_retry_remove(struct perf_event *event,
+			      struct remove_event *rep)
 {
 }
 #endif
@@ -1288,7 +1286,7 @@ static void __ref perf_remove_from_context(struct perf_event *event, bool detach
 		ret = cpu_function_call(event->cpu, __perf_remove_from_context, &re);
 
 		if (ret == -ENXIO)
-			perf_retry_remove(event, detach_group);
+			perf_retry_remove(event, &re);
 		return;
 	}
 
@@ -3073,6 +3071,16 @@ static void put_event(struct perf_event *event)
 
 static int perf_release(struct inode *inode, struct file *file)
 {
+	struct perf_event *event = file->private_data;
+
+	/*
+	 * Event can be in state OFF because of a constraint check.
+	 * Change to ACTIVE so that it gets cleaned up correctly.
+	 */
+	if ((event->state == PERF_EVENT_STATE_OFF) &&
+			event->attr.constraint_duplicate)
+		event->state = PERF_EVENT_STATE_ACTIVE;
+
 	put_event(file->private_data);
 	return 0;
 }
