@@ -1341,6 +1341,9 @@ static unsigned int __cpufreq_get(unsigned int cpu)
 
 	ret_freq = cpufreq_driver->get(cpu);
 
+	if (!policy)
+		return ret_freq;
+
 	if (ret_freq && policy->cur &&
 		!(cpufreq_driver->flags & CPUFREQ_CONST_LOOPS)) {
 		/* verify no discrepancy between actual and
@@ -1899,28 +1902,6 @@ static int __cpuinit cpufreq_cpu_callback(struct notifier_block *nfb,
 		case CPU_ONLINE:
 		case CPU_ONLINE_FROZEN:
 			cpufreq_add_dev(dev, NULL);
-#ifdef CONFIG_SEC_DVFS
-			/* if min or max lock is set, online cpu needs to change it's own rate immediately after addind cpufreq_dev */
-			{
-				unsigned int target_freq, min_freq, max_freq;
-				struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
-				if (policy) {
-					min_freq = get_min_lock();
-					max_freq = get_max_lock();
-
-					target_freq = policy->cur;
-					if (min_freq && target_freq < min_freq)
-						target_freq = min_freq;
-					if (max_freq && target_freq > max_freq)
-						target_freq = max_freq;
-
-					if (target_freq != policy->cur)
-						__cpufreq_driver_target(policy, target_freq, CPUFREQ_RELATION_L);
-
-					cpufreq_cpu_put(policy);
-				}
-			}
-#endif
 			break;
 		case CPU_DOWN_PREPARE:
 		case CPU_DOWN_PREPARE_FROZEN:
@@ -1981,7 +1962,11 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	cpufreq_driver = driver_data;
 	spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
 
+	register_hotcpu_notifier(&cpufreq_cpu_notifier);
+
+	get_online_cpus();
 	ret = subsys_interface_register(&cpufreq_interface);
+	put_online_cpus();
 	if (ret)
 		goto err_null_driver;
 
@@ -2004,13 +1989,13 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 		}
 	}
 
-	register_hotcpu_notifier(&cpufreq_cpu_notifier);
 	pr_debug("driver %s up and running\n", driver_data->name);
 
 	return 0;
 err_if_unreg:
 	subsys_interface_unregister(&cpufreq_interface);
 err_null_driver:
+	unregister_hotcpu_notifier(&cpufreq_cpu_notifier);
 	spin_lock_irqsave(&cpufreq_driver_lock, flags);
 	cpufreq_driver = NULL;
 	spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
