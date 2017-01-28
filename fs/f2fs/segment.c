@@ -331,8 +331,10 @@ static int __commit_inmem_pages(struct inode *inode,
 
 			set_page_dirty(page);
 			f2fs_wait_on_page_writeback(page, DATA, true);
-			if (clear_page_dirty_for_io(page))
+			if (clear_page_dirty_for_io(page)) {
 				inode_dec_dirty_pages(inode);
+				remove_dirty_inode(inode);
+			}
 
 			fio.page = page;
 			err = do_write_data_page(&fio);
@@ -437,7 +439,7 @@ void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi)
 	if (!available_free_memory(sbi, FREE_NIDS))
 		try_to_free_nids(sbi, MAX_FREE_NIDS);
 	else
-		build_free_nids(sbi);
+		build_free_nids(sbi, false);
 
 	/* checkpoint is the only way to shrink partial cached entries */
 	if (!available_free_memory(sbi, NAT_ENTRIES) ||

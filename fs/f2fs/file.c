@@ -711,7 +711,6 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
 			err = f2fs_truncate(inode);
 			if (err)
 				return err;
-			f2fs_balance_fs(F2FS_I_SB(inode), true);
 		} else {
 			/*
 			 * do not trim all blocks after i_size if target size is
@@ -740,6 +739,10 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
 	}
 
 	f2fs_mark_inode_dirty_sync(inode);
+
+	/* inode change will produce dirty node pages flushed by checkpoint */
+	f2fs_balance_fs(F2FS_I_SB(inode), true);
+
 	return err;
 }
 
@@ -986,7 +989,7 @@ static int __clone_blkaddrs(struct inode *src_inode, struct inode *dst_inode,
 				new_size = (dst + i) << PAGE_SHIFT;
 				if (dst_inode->i_size < new_size)
 					f2fs_i_size_write(dst_inode, new_size);
-			} while ((do_replace[i] || blkaddr[i] == NULL_ADDR) && --ilen);
+			} while (--ilen && (do_replace[i] || blkaddr[i] == NULL_ADDR));
 
 			f2fs_put_dnode(&dn);
 		} else {
@@ -1237,6 +1240,9 @@ static int f2fs_zero_range(struct inode *inode, loff_t offset, loff_t len,
 			ret = f2fs_do_zero_range(&dn, index, end);
 			f2fs_put_dnode(&dn);
 			f2fs_unlock_op(sbi);
+
+			f2fs_balance_fs(sbi, dn.node_changed);
+
 			if (ret)
 				goto out;
 
