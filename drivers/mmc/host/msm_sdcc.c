@@ -3,7 +3,7 @@
  *
  *  Copyright (C) 2007 Google Inc,
  *  Copyright (C) 2003 Deep Blue Solutions, Ltd, All Rights Reserved.
- *  Copyright (c) 2009-2012, The Linux Foundation. All rights reserved.
+ *  Copyright (c) 2009-2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -524,8 +524,6 @@ msmsdcc_request_end(struct msmsdcc_host *host, struct mmc_request *mrq)
 
 	if (mrq->data)
 		mrq->data->bytes_xfered = host->curr.data_xfered;
-	if (mrq->cmd->error == -ETIMEDOUT)
-		mdelay(5);
 
 	msmsdcc_reset_dpsm(host);
 
@@ -1920,7 +1918,9 @@ msmsdcc_irq(int irq, void *dev_id)
 			 * will take care of signaling sdio irq during
 			 * mmc_sdio_resume().
 			 */
-			if (host->sdcc_suspended) {
+			if (host->sdcc_suspended &&
+					(host->plat->mpm_sdiowakeup_int ||
+					 host->plat->sdiowakeup_irq)) {
 				/*
 				 * This is a wakeup interrupt so hold wakelock
 				 * until SDCC resume is handled.
@@ -5015,9 +5015,6 @@ store_polling(struct device *dev, struct device_attribute *attr,
 	} else {
 		mmc->caps &= ~MMC_CAP_NEEDS_POLL;
 	}
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	host->polling_enabled = mmc->caps & MMC_CAP_NEEDS_POLL;
-#endif
 	spin_unlock_irqrestore(&host->lock, flags);
 	return count;
 }
@@ -5136,33 +5133,6 @@ store_enable_auto_cmd21(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-static void msmsdcc_early_suspend(struct early_suspend *h)
-{
-	struct msmsdcc_host *host =
-		container_of(h, struct msmsdcc_host, early_suspend);
-	unsigned long flags;
-
-	spin_lock_irqsave(&host->lock, flags);
-	host->polling_enabled = host->mmc->caps & MMC_CAP_NEEDS_POLL;
-	host->mmc->caps &= ~MMC_CAP_NEEDS_POLL;
-	spin_unlock_irqrestore(&host->lock, flags);
-};
-static void msmsdcc_late_resume(struct early_suspend *h)
-{
-	struct msmsdcc_host *host =
-		container_of(h, struct msmsdcc_host, early_suspend);
-	unsigned long flags;
-
-	if (host->polling_enabled) {
-		spin_lock_irqsave(&host->lock, flags);
-		host->mmc->caps |= MMC_CAP_NEEDS_POLL;
-		mmc_detect_change(host->mmc, 0);
-		spin_unlock_irqrestore(&host->lock, flags);
-	}
-};
-#endif
 
 static void msmsdcc_print_regs(const char *name, void __iomem *base,
 			       u32 phys_base, unsigned int no_of_regs)
@@ -6151,8 +6121,6 @@ msmsdcc_probe(struct platform_device *pdev)
 	host->sdcc_irq_disabled = 1;
 
 	if (plat->sdiowakeup_irq) {
-		wake_lock_init(&host->sdio_wlock, WAKE_LOCK_SUSPEND,
-				mmc_hostname(mmc));
 		ret = request_irq(plat->sdiowakeup_irq,
 			msmsdcc_platform_sdiowakeup_irq,
 			IRQF_SHARED | IRQF_TRIGGER_LOW,
@@ -6171,7 +6139,7 @@ msmsdcc_probe(struct platform_device *pdev)
 		}
 	}
 
-	if (host->plat->mpm_sdiowakeup_int) {
+	if (plat->sdiowakeup_irq || plat->mpm_sdiowakeup_int) {
 		wake_lock_init(&host->sdio_wlock, WAKE_LOCK_SUSPEND,
 				mmc_hostname(mmc));
 	}
@@ -6214,11 +6182,7 @@ msmsdcc_probe(struct platform_device *pdev)
 		       mmc_hostname(mmc));
 
 /* SYSFS about SD Card Detection by soonil.lim */
-#ifndef CONFIG_MMC_MSM_SDC4_SUPPORT
-	if (t_flash_detect_dev == NULL && (host->pdev_id == 3)) {
-#else
 	if (t_flash_detect_dev == NULL && gpio_is_valid(plat->status_gpio)) {
-#endif
 		printk(KERN_DEBUG "%s : Change sysfs Card Detect\n", __func__);
 
 		t_flash_detect_dev = device_create(sec_class,
@@ -6277,13 +6241,6 @@ msmsdcc_probe(struct platform_device *pdev)
 	mmc->clk_scaling.down_threshold = 5;
 	mmc->clk_scaling.polling_delay_ms = 100;
 	mmc->caps2 |= MMC_CAP2_CLK_SCALE;
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	host->early_suspend.suspend = msmsdcc_early_suspend;
-	host->early_suspend.resume  = msmsdcc_late_resume;
-	host->early_suspend.level   = EARLY_SUSPEND_LEVEL_DISABLE_FB;
-	register_early_suspend(&host->early_suspend);
-#endif
 
 	pr_info("%s: Qualcomm MSM SDCC-core at 0x%016llx irq %d,%d dma %d"
 		" dmacrcri %d\n", mmc_hostname(mmc),
@@ -6401,12 +6358,12 @@ msmsdcc_probe(struct platform_device *pdev)
 	if (plat->status_irq)
 		free_irq(plat->status_irq, host);
  sdiowakeup_irq_free:
+	if (plat->sdiowakeup_irq || plat->mpm_sdiowakeup_int)
+		wake_lock_destroy(&host->sdio_wlock);
 	wake_lock_destroy(&host->sdio_suspend_wlock);
 	if (plat->sdiowakeup_irq)
 		free_irq(plat->sdiowakeup_irq, host);
  pio_irq_free:
-	if (plat->sdiowakeup_irq)
-		wake_lock_destroy(&host->sdio_wlock);
 	free_irq(core_irqres->start, host);
  irq_free:
 	free_irq(core_irqres->start, host);
@@ -6499,10 +6456,12 @@ static int msmsdcc_remove(struct platform_device *pdev)
 
 	wake_lock_destroy(&host->sdio_suspend_wlock);
 	if (plat->sdiowakeup_irq) {
-		wake_lock_destroy(&host->sdio_wlock);
 		irq_set_irq_wake(plat->sdiowakeup_irq, 0);
 		free_irq(plat->sdiowakeup_irq, host);
 	}
+
+	if (plat->sdiowakeup_irq || plat->mpm_sdiowakeup_int)
+		wake_lock_destroy(&host->sdio_wlock);
 
 	free_irq(host->core_irqres->start, host);
 	free_irq(host->core_irqres->start, host);
@@ -6538,9 +6497,6 @@ static int msmsdcc_remove(struct platform_device *pdev)
 	iounmap(host->base);
 	mmc_free_host(mmc);
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	unregister_early_suspend(&host->early_suspend);
-#endif
 	pm_runtime_disable(&(pdev)->dev);
 	pm_runtime_set_suspended(&(pdev)->dev);
 
@@ -6772,18 +6728,22 @@ msmsdcc_runtime_resume(struct device *dev)
 	if (host->plat->is_sdio_al_client)
 		goto out;
 
+#if defined(CONFIG_BCM4335) || defined(CONFIG_BCM4335_MODULE)
 	if (host->pdev_id == 3) {
 		printk(KERN_INFO "%s: Enter WIFI resume\n", __func__);
 	}
+#endif
 
 	pr_debug("%s: %s: start\n", mmc_hostname(mmc), __func__);
 	if (mmc) {
 		if (mmc->card && mmc_card_sdio(mmc->card) &&
 				mmc_card_keep_power(mmc)) {
 			msmsdcc_ungate_clock(host);
+#if defined(CONFIG_BCM4335) || defined(CONFIG_BCM4335_MODULE)
 			if (host->pdev_id == 3) {
 				printk(KERN_INFO "%s: To check whether skip the WIFI resume in mmc_card_keep_power\n", __func__);
 			}
+#endif
 		}
 
 		mmc_resume_host(mmc);

@@ -250,8 +250,13 @@ static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
 	spin_lock_irq(&ctx->wqh.lock);
 	if (file->f_flags & O_NONBLOCK)
 		res = -EAGAIN;
-	else
+	else {
+		printk("timerfd blocking read by tid %d\n",
+			pid_nr(get_task_pid(current, PIDTYPE_PID)));
 		res = wait_event_interruptible_locked_irq(ctx->wqh, ctx->ticks);
+		printk("timerfd blocking read released by tid %d\n",
+			pid_nr(get_task_pid(current, PIDTYPE_PID)));
+	}
 
 	/*
 	 * If clock has changed, we do not care about the
@@ -293,11 +298,47 @@ static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
 	return res;
 }
 
+#ifdef CONFIG_CHECKPOINT_RESTORE
+static long timerfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct timerfd_ctx *ctx = file->private_data;
+	int ret = 0;
+
+	switch (cmd) {
+	case TFD_IOC_SET_TICKS: {
+		u64 ticks;
+
+		if (copy_from_user(&ticks, (u64 __user *)arg, sizeof(ticks)))
+			return -EFAULT;
+		if (!ticks)
+			return -EINVAL;
+
+		spin_lock_irq(&ctx->wqh.lock);
+		if (!timerfd_canceled(ctx)) {
+			ctx->ticks = ticks;
+			wake_up_locked(&ctx->wqh);
+		} else
+			ret = -ECANCELED;
+		spin_unlock_irq(&ctx->wqh.lock);
+		break;
+	}
+	default:
+		ret = -ENOTTY;
+		break;
+	}
+
+	return ret;
+}
+#else
+#define timerfd_ioctl NULL
+#endif
+
 static const struct file_operations timerfd_fops = {
 	.release	= timerfd_release,
 	.poll		= timerfd_poll,
 	.read		= timerfd_read,
 	.llseek		= noop_llseek,
+	.unlocked_ioctl	= timerfd_ioctl,
 };
 
 static struct file *timerfd_fget(int fd, int *fput_needed)

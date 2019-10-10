@@ -86,8 +86,7 @@ static inline struct autogroup *autogroup_create(void)
 	 * so we don't have to move tasks around upon policy change,
 	 * or flail around trying to allocate bandwidth on the fly.
 	 * A bandwidth exception in __sched_setscheduler() allows
-	 * the policy change to proceed.  Thereafter, task_group()
-	 * returns &root_task_group, so zero bandwidth is required.
+	 * the policy change to proceed.
 	 */
 	free_rt_sched_group(tg);
 	tg->rt_se = root_task_group.rt_se;
@@ -95,6 +94,7 @@ static inline struct autogroup *autogroup_create(void)
 #endif
 	tg->autogroup = ag;
 
+	sched_online_group(tg, &root_task_group);
 	return ag;
 
 out_free:
@@ -111,9 +111,6 @@ out_fail:
 bool task_wants_autogroup(struct task_struct *p, struct task_group *tg)
 {
 	if (tg != &root_task_group)
-		return false;
-
-	if (p->sched_class != &fair_sched_class)
 		return false;
 
 	/*
@@ -143,10 +140,8 @@ autogroup_move_group(struct task_struct *p, struct autogroup *ag)
 
 	p->signal->autogroup = autogroup_kref_get(ag);
 
-	t = p;
-	do {
+	for_each_thread(p, t)
 		sched_move_task(t);
-	} while_each_thread(p, t);
 
 	unlock_task_sighand(p, &flags);
 	autogroup_kref_put(prev);
